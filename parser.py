@@ -218,7 +218,7 @@ def apply_excel_formatting(path, df):
 
     for i, col in enumerate(df.columns, start=1):
         longest = max([len(str(col))] + [len(str(v)) for v in df[col]])
-        sheet.column_dimensions[get_column_letter(i)].width = min(longest + 2, 60)
+        sheet.column_dimensions[get_column_letter(i)].width = min(longest + 5, 60)
 
     price_col = df.columns.get_loc("Цена, £") + 1
     for row in range(2, sheet.max_row + 1):
