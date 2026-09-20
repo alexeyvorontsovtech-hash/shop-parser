@@ -26,7 +26,7 @@ from bs4 import BeautifulSoup
 from openpyxl.utils import get_column_letter
 
 BASE_URL = "http://books.toscrape.com/"
-USER_AGENT = "Mozilla/5.0 (compatible; PortfolioBookParser/1.0; +https://kwork.ru)"
+USER_AGENT = "Mozilla/5.0 (compatible; PortfolioBookParser/1.0; https://github.com/alexeyvorontsovtech-hash/shop-parser)"
 REQUEST_TIMEOUT = 10        # секунд на один запрос
 MAX_RETRIES = 3              # попыток на одну страницу при сетевой ошибке
 RETRY_PAUSE = 2              # пауза перед повторной попыткой, секунд
@@ -41,19 +41,25 @@ NOT_SPECIFIED = "не указано"
 
 def get_page(url, delay):
     """Скачивает страницу с вежливой задержкой и ретраями при сетевой
-    ошибке. Возвращает BeautifulSoup или None, если все попытки неудачны."""
+    ошибке, таймауте, 5xx или 429. Ошибки 4xx (кроме 429) не повторяются —
+    это означает проблему с самим запросом, а не временный сбой сервера.
+    Возвращает BeautifulSoup или None, если страница так и не загружена."""
     headers = {"User-Agent": USER_AGENT}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            # сервер не указывает charset в заголовке Content-Type, из-за
-            # этого requests по умолчанию берёт ISO-8859-1 и ломает кириллицу
-            # и спецсимволы (например, £) — определяем кодировку по содержимому
-            response.encoding = response.apparent_encoding
             time.sleep(delay)  # вежливая задержка перед следующим запросом
-            return BeautifulSoup(response.text, "html.parser")
+            return BeautifulSoup(response.content, "html.parser")
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and status != 429 and status < 500:
+                print(f"    Ошибка {status} ({url}): повторные попытки не выполняются")
+                return None
+            print(f"    Попытка {attempt}/{MAX_RETRIES} не удалась ({url}): {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_PAUSE)
         except requests.RequestException as e:
             print(f"    Попытка {attempt}/{MAX_RETRIES} не удалась ({url}): {e}")
             if attempt < MAX_RETRIES:
@@ -124,9 +130,12 @@ def parse_product_card(card, page_url, category_name):
 
 def scrape_category(name, start_url, delay):
     """Обходит все страницы категории (с пагинацией) и собирает товары.
-    Возвращает (список товаров, количество ошибок/пропусков)."""
+    Возвращает (список товаров, ошибок разбора карточек, признак полноты
+    категории, номер последней успешно собранной страницы)."""
     products = []
     errors = 0
+    complete = True
+    last_completed_page = 0
     url = start_url
     page_num = 1
 
@@ -135,27 +144,46 @@ def scrape_category(name, start_url, delay):
         soup = get_page(url, delay)
 
         if soup is None:
-            print(f"  [{name}] страница {page_num} не загружена после {MAX_RETRIES} попыток — пропущена")
-            errors += 1
+            print(f"  [{name}] страница {page_num} не загружена после {MAX_RETRIES} попыток — категория неполная")
+            complete = False
             break
 
         cards = soup.select("article.product_pod")
+        if not cards:
+            print(f"  [{name}] страница {page_num} не содержит товаров — категория неполная")
+            complete = False
+            break
+
         for card in cards:
             try:
                 products.append(parse_product_card(card, url, name))
             except Exception as e:
                 print(f"  [{name}] пропущен товар из-за ошибки разбора: {e}")
                 errors += 1
+                complete = False
 
+        last_completed_page = page_num
         url = get_next_page_url(soup, url)
         page_num += 1
 
-    return products, errors
+    return products, errors, complete, last_completed_page
 
 
 # =====================================================================
 # Сохранение результата
 # =====================================================================
+
+def parse_price(value):
+    """Превращает текст цены вида '£45.17' в число. Если распознать не
+    удалось (например, значение — NOT_SPECIFIED), возвращает None."""
+    if isinstance(value, str):
+        cleaned = value.replace("£", "").replace(",", "").strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return value
+
 
 def save_to_excel(products, output_path):
     if not products:
@@ -167,6 +195,8 @@ def save_to_excel(products, output_path):
 
     columns = ["Название", "Цена", "Наличие", "Категория", "Рейтинг", "Ссылка"]
     df = pd.DataFrame(products, columns=columns)
+    df["Цена"] = df["Цена"].apply(parse_price)
+    df = df.rename(columns={"Цена": "Цена, £"})
 
     try:
         df.to_excel(output_path, index=False)
@@ -176,17 +206,36 @@ def save_to_excel(products, output_path):
             "(возможно, он открыт в другой программе)."
         )
 
-    set_column_widths(output_path, df)
+    apply_excel_formatting(output_path, df)
 
 
-def set_column_widths(path, df):
-    """Расширяет столбцы по самому длинному значению, чтобы файл сразу
-    открывался читаемым, без ручной подгонки ширины в Excel."""
+def apply_excel_formatting(path, df):
+    """Расширяет столбцы по самому длинному значению, задаёт числовой
+    формат цене, делает ссылки кликабельными, включает автофильтр и
+    закрепляет строку заголовка."""
     workbook = openpyxl.load_workbook(path)
     sheet = workbook.active
+
     for i, col in enumerate(df.columns, start=1):
-        longest = max([len(col)] + [len(str(v)) for v in df[col]])
+        longest = max([len(str(col))] + [len(str(v)) for v in df[col]])
         sheet.column_dimensions[get_column_letter(i)].width = min(longest + 2, 60)
+
+    price_col = df.columns.get_loc("Цена, £") + 1
+    for row in range(2, sheet.max_row + 1):
+        cell = sheet.cell(row=row, column=price_col)
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = "0.00"
+
+    link_col = df.columns.get_loc("Ссылка") + 1
+    for row in range(2, sheet.max_row + 1):
+        cell = sheet.cell(row=row, column=link_col)
+        if cell.value and cell.value != NOT_SPECIFIED:
+            cell.hyperlink = cell.value
+            cell.style = "Hyperlink"
+
+    sheet.auto_filter.ref = sheet.dimensions
+    sheet.freeze_panes = "A2"
+
     workbook.save(path)
 
 
@@ -234,15 +283,18 @@ def main():
     else:
         categories = all_categories
 
-    print(f"К обработке: {len(categories)} категори(я/й)\n")
+    print(f"Категорий к обработке: {len(categories)}\n")
 
     all_products = []
     total_errors = 0
+    incomplete_categories = []
 
     for name, url in categories:
-        products, errors = scrape_category(name, url, args.delay)
+        products, errors, complete, last_page = scrape_category(name, url, args.delay)
         all_products.extend(products)
         total_errors += errors
+        if not complete:
+            incomplete_categories.append((name, last_page))
         print(f"  [{name}] собрано товаров: {len(products)}\n")
 
     save_to_excel(all_products, args.output)
@@ -252,6 +304,12 @@ def main():
     print(f"Товаров собрано: {len(all_products)}")
     print(f"Ошибок/пропусков: {total_errors}")
     print(f"Результат сохранён в: {args.output}")
+
+    if incomplete_categories:
+        print("Неполные категории:")
+        for name, last_page in incomplete_categories:
+            print(f"  - {name}: собрано страниц — {last_page}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
